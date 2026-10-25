@@ -16,7 +16,9 @@ import {
   Sliders,
 } from 'lucide-react';
 import { garminConnectService } from '../services/garminConnectService';
+import { swimmerProfileService } from '../services/swimmerProfileService';
 import { dbService } from '../services/firebaseService';
+import { parseGarminCsv } from '../services/garminCsvParser';
 import { aquaticAudio } from '../audio/aquaticAudioEngine';
 
 export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
@@ -25,9 +27,11 @@ export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
   const [password, setPassword] = useState('');
 
   // Custom metrics inputs
-  const [realDist, setRealDist] = useState(2000);
-  const [realTimeMin, setRealTimeMin] = useState(35);
-  const [realSwolf, setRealSwolf] = useState(33);
+  const [realDist, setRealDist] = useState(1000);
+  const [realPaceMin, setRealPaceMin] = useState(1);
+  const [realPaceSec, setRealPaceSec] = useState(26);
+  const [realHr, setRealHr] = useState(145);
+  const [realStrokes, setRealStrokes] = useState(14);
   const [realPoolLen, setRealPoolLen] = useState(25);
 
   const [isLoading, setIsLoading] = useState(false);
@@ -98,130 +102,36 @@ export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
     const reader = new FileReader();
     reader.onload = async (e) => {
       const text = e.target.result || '';
-      const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      const parsedSessions = parseGarminCsv(text);
 
-      if (lines.length <= 1) {
+      if (parsedSessions.length === 0) {
         setIsLoading(false);
-        setErrorMessage('El archivo no contiene registros válidos de Garmin.');
+        setErrorMessage('El archivo CSV no contiene registros de natación válidos o reconocibles.');
         return;
       }
 
-      let parsedSessions = [];
-      const headerLine = lines[0];
-      const headers = headerLine.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((h) => h.replace(/^"|"$/g, '').trim().toLowerCase());
+      // Clear old cached sessions in dbService before saving new ones
+      await dbService.clearAll();
+      await dbService.saveSessionsBatch(parsedSessions);
+      await garminConnectService.connectAndSync(email || 'usuario_garmin@connect.com', 'dummy');
 
-      const distIdx = headers.findIndex((h) => h.includes('distance') || h.includes('distancia'));
-      const timeIdx = headers.findIndex((h) => h.includes('time') || h.includes('tiempo'));
-      const swolfIdx = headers.findIndex((h) => h.includes('swolf'));
-      const hrIdx = headers.findIndex((h) => h.includes('avg hr') || h.includes('frecuencia') || h.includes('hr'));
-      const maxHrIdx = headers.findIndex((h) => h.includes('max hr'));
-      const strokesIdx = headers.findIndex((h) => h.includes('strokes') || h.includes('brazadas'));
-      const dateIdx = headers.findIndex((h) => h.includes('date') || h.includes('fecha'));
-      const titleIdx = headers.findIndex((h) => h.includes('title') || h.includes('título'));
-      const paceIdx = headers.findIndex((h) => h.includes('avg pace') || h.includes('ritmo'));
-
-      const dataLines = lines.slice(1);
-
-      dataLines.forEach((line, idx) => {
-        const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c) => c.replace(/^"|"$/g, '').trim());
-        if (cols.length < 2) return;
-
-        // Parse Distance (handling "3,225" or "2,625")
-        let distVal = 2000;
-        if (distIdx !== -1 && cols[distIdx]) {
-          const parsedD = parseFloat(cols[distIdx].replace(/,/g, ''));
-          if (!isNaN(parsedD) && parsedD > 0) distVal = parsedD;
-        }
-
-        // Parse SWOLF
-        let swolfVal = 34;
-        if (swolfIdx !== -1 && cols[swolfIdx]) {
-          const parsedS = parseFloat(cols[swolfIdx]);
-          if (!isNaN(parsedS) && parsedS > 0) swolfVal = parsedS;
-        }
-
-        // Parse Heart Rate
-        let hrVal = 142;
-        if (hrIdx !== -1 && cols[hrIdx]) {
-          const parsedH = parseFloat(cols[hrIdx]);
-          if (!isNaN(parsedH) && parsedH > 0) hrVal = parsedH;
-        }
-
-        // Parse Max HR
-        let maxHrVal = hrVal + 18;
-        if (maxHrIdx !== -1 && cols[maxHrIdx]) {
-          const parsedMH = parseFloat(cols[maxHrIdx]);
-          if (!isNaN(parsedMH) && parsedMH > 0) maxHrVal = parsedMH;
-        }
-
-        // Parse Strokes
-        let strokesVal = Math.round((distVal / 25) * 15);
-        if (strokesIdx !== -1 && cols[strokesIdx]) {
-          const parsedSt = parseFloat(cols[strokesIdx].replace(/,/g, ''));
-          if (!isNaN(parsedSt) && parsedSt > 0) strokesVal = parsedSt;
-        }
-
-        // Parse Date
-        let dateVal = new Date().toISOString().split('T')[0];
-        if (dateIdx !== -1 && cols[dateIdx]) {
-          const matchD = cols[dateIdx].match(/\d{4}-\d{2}-\d{2}/);
-          if (matchD) dateVal = matchD[0];
-        }
-
-        // Title
-        let titleVal = `Natación Garmin Real (${Math.round(distVal)}m)`;
-        if (titleIdx !== -1 && cols[titleIdx] && cols[titleIdx] !== '--') {
-          titleVal = `${cols[titleIdx]} (${Math.round(distVal)}m)`;
-        }
-
-        // Pace
-        let paceVal = '1:30';
-        if (paceIdx !== -1 && cols[paceIdx] && cols[paceIdx].includes(':')) {
-          paceVal = cols[paceIdx];
-        }
-
-        parsedSessions.push({
-          id: `garmin-real-file-${Date.now()}-${idx}`,
-          date: dateVal,
-          title: titleVal,
-          poolLength: 25,
-          totalDistance: Math.round(distVal),
-          totalTimeSeconds: Math.round((distVal / 100) * 90),
-          avgSwolf: Math.round(swolfVal),
-          avgPace100m: paceVal,
-          avgHeartRate: Math.round(hrVal),
-          maxHeartRate: Math.round(maxHrVal),
-          totalStrokes: Math.round(strokesVal),
-          calories: Math.round(distVal * 0.22),
-          trainingLoad: Math.round(distVal * 0.06),
-          source: 'Archivo Exportado de Garmin Connect (.CSV/.FIT)',
-          laps: [
-            { lap: 1, dist: Math.round(distVal / 2), pace: paceVal, swolf: Math.round(swolfVal), strokes: Math.round(strokesVal / 2), hr: Math.round(hrVal) },
-            { lap: 2, dist: Math.round(distVal / 2), pace: paceVal, swolf: Math.round(swolfVal + 1), strokes: Math.round(strokesVal / 2), hr: Math.round(hrVal + 4) },
-          ],
-          strokesDistribution: { freestyle: 95, backstroke: 5, breaststroke: 0, butterfly: 0 },
-          hrZones: { z1: 20, z2: 60, z3: 20, z4: 0 },
-        });
-      });
-
-      if (parsedSessions.length > 0) {
-        await dbService.saveSessionsBatch(parsedSessions);
-        await garminConnectService.connectAndSync(email || 'usuario_garmin@connect.com', 'dummy');
-
-        try {
-          aquaticAudio.playSonar();
-        } catch (err) {}
-
-        setIsLoading(false);
-        setUploadSuccess(`¡Éxito! Se importaron ${parsedSessions.length} actividades reales.`);
-        if (onSyncComplete) {
-          onSyncComplete(parsedSessions);
-        }
-        setTimeout(() => onClose(), 600);
-      } else {
-        setIsLoading(false);
-        setErrorMessage('No se pudieron extraer métricas del archivo.');
+      // Replace CSV workouts in active swimmer profile
+      const profiles = swimmerProfileService.getProfiles();
+      if (profiles.length > 0) {
+        const targetId = profiles[0].id;
+        swimmerProfileService.replaceSwimmerWorkouts(targetId, parsedSessions);
       }
+
+      try {
+        aquaticAudio.playSonar();
+      } catch (err) {}
+
+      setIsLoading(false);
+      setUploadSuccess(`¡Éxito! Se importaron ${parsedSessions.length} actividades reales y se recalcularon los promedios.`);
+      if (onSyncComplete) {
+        onSyncComplete(parsedSessions);
+      }
+      setTimeout(() => onClose(), 600);
     };
 
     reader.readAsText(file);
@@ -231,31 +141,37 @@ export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
   const handleMetricsSubmit = async (e) => {
     e.preventDefault();
     setIsLoading(true);
-    const userLabel = email ? email.split('@')[0] : 'Nadador';
-    const timeSecs = Number(realTimeMin) * 60;
-    const pace100Secs = Math.round(timeSecs / (Number(realDist) / 100));
+    const userLabel = email ? email.split('@')[0] : 'Coach';
+    
+    const pace100Secs = Number(realPaceMin) * 60 + Number(realPaceSec);
+    const timeSecs = (Number(realDist) / 100) * pace100Secs;
     const pMins = Math.floor(pace100Secs / 60);
     const pSecs = pace100Secs % 60;
     const paceStr = `${pMins}:${pSecs < 10 ? '0' : ''}${pSecs}`;
+    
+    // SWOLF is typically (Time for 1 length) + (Strokes per length)
+    // Time for 1 length (25m) = pace100Secs / 4 (assuming 25m pool)
+    const timePerLength = pace100Secs / (100 / Number(realPoolLen));
+    const calcSwolf = Math.round(timePerLength + Number(realStrokes));
 
     const realSession = {
-      id: `garmin-real-user-${Date.now()}`,
+      id: `garmin-manual-${Date.now()}`,
       date: new Date().toISOString().split('T')[0],
-      title: `Natación Garmin Real de ${userLabel} (${realDist}m)`,
+      title: `Sesión Manual (Coach) - ${realDist}m`,
       poolLength: Number(realPoolLen),
       totalDistance: Number(realDist),
       totalTimeSeconds: timeSecs,
-      avgSwolf: Number(realSwolf),
+      avgSwolf: calcSwolf,
       avgPace100m: paceStr,
-      avgHeartRate: 145,
-      maxHeartRate: 168,
-      totalStrokes: Math.round((Number(realDist) / Number(realPoolLen)) * 15),
+      avgHeartRate: Number(realHr),
+      maxHeartRate: Number(realHr) + 15,
+      totalStrokes: Math.round((Number(realDist) / Number(realPoolLen)) * Number(realStrokes)),
       calories: Math.round(Number(realDist) * 0.22),
       trainingLoad: Math.round(Number(realDist) * 0.06),
-      source: 'Métricas Reales Registradas por el Usuario',
+      source: 'Ingreso Manual Rápido (Coach)',
       laps: [
-        { lap: 1, dist: Number(realDist) / 2, pace: paceStr, swolf: Number(realSwolf), strokes: 15, hr: 142 },
-        { lap: 2, dist: Number(realDist) / 2, pace: paceStr, swolf: Number(realSwolf) + 1, strokes: 15, hr: 148 },
+        { lap: 1, dist: Number(realDist) / 2, pace: paceStr, swolf: calcSwolf, strokes: Number(realStrokes), hr: Number(realHr) - 2 },
+        { lap: 2, dist: Number(realDist) / 2, pace: paceStr, swolf: calcSwolf + 1, strokes: Number(realStrokes), hr: Number(realHr) + 2 },
       ],
       strokesDistribution: { freestyle: 90, backstroke: 10, breaststroke: 0, butterfly: 0 },
       hrZones: { z1: 20, z2: 60, z3: 20, z4: 0 },
@@ -306,28 +222,39 @@ export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
         </div>
 
         {/* Tab Selector */}
-        <div className="flex items-center gap-2 bg-ocean-950 p-1 rounded-xl border border-ocean-700 text-xs font-bold">
+        <div className="flex flex-col sm:flex-row items-center gap-2 bg-ocean-950 p-1 rounded-xl border border-ocean-700 text-xs font-bold">
           <button
             onClick={() => setActiveTab('credentials')}
-            className={`flex-1 py-2.5 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+            className={`flex-1 w-full py-2.5 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
               activeTab === 'credentials'
                 ? 'bg-biolum-cyan text-ocean-950 shadow-md'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
             <Zap className="w-4 h-4" />
-            1. Login Credenciales (Email & Password)
+            1. Login
           </button>
           <button
             onClick={() => setActiveTab('upload')}
-            className={`flex-1 py-2.5 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+            className={`flex-1 w-full py-2.5 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
               activeTab === 'upload'
                 ? 'bg-biolum-emerald text-ocean-950 shadow-md'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
             <UploadCloud className="w-4 h-4" />
-            2. Archivo .CSV/.FIT
+            2. CSV/.FIT
+          </button>
+          <button
+            onClick={() => setActiveTab('manual')}
+            className={`flex-1 w-full py-2.5 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+              activeTab === 'manual'
+                ? 'bg-amber-400 text-ocean-950 shadow-md'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Sliders className="w-4 h-4" />
+            3. Carga Rápida
           </button>
         </div>
 
@@ -439,7 +366,129 @@ export const GarminConnectModal = ({ isOpen, onClose, onSyncComplete }) => {
                 <span>{uploadSuccess}</span>
               </div>
             )}
+
+            <div className="pt-3 border-t border-ocean-800 flex justify-center">
+              <button
+                type="button"
+                onClick={async () => {
+                  await dbService.clearAll();
+                  swimmerProfileService.resetToDefaults();
+                  setUploadSuccess('Se limpió el historial almacenado y se reestablecieron los datos.');
+                  if (onSyncComplete) onSyncComplete([]);
+                }}
+                className="text-xs text-rose-400 hover:text-rose-300 underline font-mono flex items-center gap-1"
+              >
+                <X className="w-3.5 h-3.5" /> Limpiar datos anteriores guardados en caché
+              </button>
+            </div>
           </div>
+        )}
+
+        {/* TAB 3: Manual Quick Entry */}
+        {activeTab === 'manual' && (
+          <form onSubmit={handleMetricsSubmit} className="space-y-4">
+            <div className="p-4 bg-ocean-950/80 rounded-2xl border border-ocean-750 text-xs text-slate-300 space-y-2">
+              <p>
+                <strong className="text-amber-400 font-bold">Modo Entrenador:</strong> Ingresa el resumen que aparece en la pantalla del reloj para generar una simulación instantánea.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              {/* Distancia */}
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-slate-300 flex items-center gap-1">Distancia (m)</label>
+                <input
+                  type="number"
+                  required
+                  min="50"
+                  step="25"
+                  value={realDist}
+                  onChange={(e) => setRealDist(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                />
+              </div>
+
+              {/* Pool Length */}
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-slate-300 flex items-center gap-1">Piscina (m)</label>
+                <select
+                  value={realPoolLen}
+                  onChange={(e) => setRealPoolLen(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                >
+                  <option value={25}>25m (Corta)</option>
+                  <option value={50}>50m (Olímpica)</option>
+                </select>
+              </div>
+
+              {/* Ritmo / 100m */}
+              <div className="space-y-1 col-span-2">
+                <label className="text-xs font-bold text-slate-300 flex items-center gap-1">Ritmo Medio por 100m (MM:SS)</label>
+                <div className="flex gap-2 items-center">
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    max="10"
+                    value={realPaceMin}
+                    onChange={(e) => setRealPaceMin(e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-amber-400 text-center"
+                    placeholder="Min"
+                  />
+                  <span className="font-bold text-white">:</span>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    max="59"
+                    value={realPaceSec}
+                    onChange={(e) => setRealPaceSec(e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-amber-400 text-center"
+                    placeholder="Seg"
+                  />
+                </div>
+              </div>
+
+              {/* Pulso (HR) */}
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-rose-400 flex items-center gap-1">Pulso Medio (ppm)</label>
+                <input
+                  type="number"
+                  required
+                  min="60"
+                  max="220"
+                  value={realHr}
+                  onChange={(e) => setRealHr(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-rose-400"
+                />
+              </div>
+
+              {/* Brazadas */}
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-biolum-emerald flex items-center gap-1">Brazadas/largo</label>
+                <input
+                  type="number"
+                  required
+                  min="5"
+                  max="50"
+                  step="0.1"
+                  value={realStrokes}
+                  onChange={(e) => setRealStrokes(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl bg-ocean-900 border border-ocean-700 text-white font-mono text-sm focus:outline-none focus:border-biolum-emerald"
+                />
+              </div>
+            </div>
+
+            {/* Submit Button */}
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="w-full py-3.5 px-4 rounded-xl font-bold text-ocean-950 bg-amber-400 hover:bg-amber-300 text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20 transition-all mt-4"
+            >
+              <Zap className="w-4 h-4" />
+              Generar Simulación Automática
+            </button>
+          </form>
         )}
 
       </div>

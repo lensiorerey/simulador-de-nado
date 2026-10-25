@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { GarminConnectModal } from './GarminConnectModal';
 import { SwimEfficiencyHeroBlock } from './SwimEfficiencyHeroBlock';
+
 import { SwimStrokeSimulator } from './SwimStrokeSimulator';
+import { SwimmerProfileManager } from './SwimmerProfileManager';
+import { SwimmerComparisonMatrix } from './SwimmerComparisonMatrix';
+import { ShareSimulationModal } from './ShareSimulationModal';
+import { swimmerProfileService } from '../services/swimmerProfileService';
+import { shareService } from '../services/shareService';
 import { dbService } from '../services/firebaseService';
 import { garminConnectService } from '../services/garminConnectService';
-
-
 
 import {
   Chart as ChartJS,
@@ -35,7 +39,12 @@ import {
   Award,
   CheckCircle2,
   HelpCircle,
+  Swords,
+  Users,
+  Share2,
+  Sliders,
   Check,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { aquaticAudio } from '../audio/aquaticAudioEngine';
 
@@ -53,40 +62,47 @@ ChartJS.register(
   Filler
 );
 
-const emptyDefaultSession = {
-  id: 'empty',
-  date: new Date().toISOString().split('T')[0],
-  title: 'Sin Datos Garmin Cargados',
-  poolLength: 25,
-  totalDistance: 0,
-  totalTimeSeconds: 0,
-  avgSwolf: 0,
-  avgPace100m: '0:00',
-  avgHeartRate: 0,
-  maxHeartRate: 0,
-  totalStrokes: 0,
-  calories: 0,
-  trainingLoad: 0,
-  laps: [],
-  strokesDistribution: { freestyle: 100, backstroke: 0, breaststroke: 0, butterfly: 0 },
-  hrZones: { z1: 0, z2: 0, z3: 0, z4: 0 },
-};
-
 export const GarminDashboard = ({ onOpenGuide }) => {
+  // Navigation Tabs: 'technique' | 'simulator' | 'profiles' | 'matrix'
+  const [activeTab, setActiveTab] = useState('technique');
+
+  // Swimmer Profiles state
+  const [profiles, setProfiles] = useState([]);
+  const [activeSwimmerIds, setActiveSwimmerIds] = useState([]);
+
+  // Garmin Modal & Share Modal
+  const [isGarminConnectOpen, setIsGarminConnectOpen] = useState(false);
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+
+  // Single Session Detailed Analytics state
   const [sessions, setSessions] = useState([]);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadSuccess, setUploadSuccess] = useState(false);
-  const [showManualForm, setShowManualForm] = useState(false);
-  const [isGarminConnectOpen, setIsGarminConnectOpen] = useState(false);
-  const [dbStatus, setDbStatus] = useState({ isConnected: false });
 
-  // Load Database sessions on mount
+  // Load swimmer profiles & check shared URL hash on mount
   useEffect(() => {
-    async function loadDbData() {
-      const status = await dbService.getConnectionStatus();
-      setDbStatus(status);
+    // 1. Load swimmer profiles
+    const loadedProfiles = swimmerProfileService.getProfiles();
+    setProfiles(loadedProfiles);
 
+    // 2. Check for shared URL hash
+    const sharedData = shareService.parseShareHash();
+    if (sharedData && sharedData.swimmers && sharedData.swimmers.length > 0) {
+      // Merge shared swimmers into profile service
+      const mergedProfiles = [...sharedData.swimmers, ...loadedProfiles];
+      setProfiles(mergedProfiles);
+      setActiveSwimmerIds(sharedData.swimmers.map((s) => s.id));
+      setActiveTab('technique');
+      try {
+        aquaticAudio.playChime();
+      } catch (e) {}
+    } else {
+      // Default: activate first 2 swimmers for instant race comparison
+      const initialActive = loadedProfiles.slice(0, 2).map((p) => p.id);
+      setActiveSwimmerIds(initialActive);
+    }
+
+    // 3. Load DB sessions for detailed analytics tab
+    async function loadDbData() {
       const dbSessions = await dbService.getSessions();
       if (dbSessions && dbSessions.length > 0) {
         setSessions(dbSessions);
@@ -96,745 +112,171 @@ export const GarminDashboard = ({ onOpenGuide }) => {
     loadDbData();
   }, []);
 
-  // Manual Form State
-  const [manualDist, setManualDist] = useState(2000);
-  const [manualTimeMin, setManualTimeMin] = useState(38);
-  const [manualStrokesPerLap, setManualStrokesPerLap] = useState(15);
-  const [manualPool, setManualPool] = useState(25);
-
-  const currentSession = sessions.find((s) => s.id === selectedSessionId) || sessions[0] || emptyDefaultSession;
-
-
-  // Helper format seconds to mm:ss
-  const formatTime = (totalSeconds) => {
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    return `${mins}m ${secs < 10 ? '0' : ''}${secs}s`;
+  // Reload profiles helper
+  const reloadProfiles = () => {
+    const updated = swimmerProfileService.getProfiles();
+    setProfiles(updated);
   };
 
-  // Advanced Parser for Garmin CSV (Multi-Activity & Single Activity)
-  const processUploadedFile = (file) => {
-    if (!file) return;
-    setIsUploading(true);
-    aquaticAudio.playBubbleSound();
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target.result || '';
-      
-      let importedSessions = [];
-      const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-
-      // Helper: parse duration string "00:45:20" or "45:20" or seconds
-      const parseDurationString = (str) => {
-        if (!str) return 2400;
-        const parts = str.split(':').map((p) => parseFloat(p));
-        if (parts.length === 3) return Math.round(parts[0] * 3600 + parts[1] * 60 + parts[2]);
-        if (parts.length === 2) return Math.round(parts[0] * 60 + parts[1]);
-        const val = parseFloat(str);
-        return !isNaN(val) ? Math.round(val) : 2400;
-      };
-
-      if (lines.length > 1) {
-        let isMultiActivityFile = false;
-        const firstLine = lines[0].toLowerCase();
-        
-        // Detect if this is an Activities summary CSV containing multiple workouts
-        if (
-          firstLine.includes('date') ||
-          firstLine.includes('fecha') ||
-          firstLine.includes('activity') ||
-          firstLine.includes('tipo') ||
-          lines.length > 5
-        ) {
-          isMultiActivityFile = true;
-        }
-
-        if (isMultiActivityFile) {
-          const headerLine = lines[0];
-          const headers = headerLine.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((h) => h.replace(/^"|"$/g, '').trim().toLowerCase());
-
-          const distIdx = headers.findIndex((h) => h.includes('distance') || h.includes('distancia'));
-          const timeIdx = headers.findIndex((h) => h.includes('time') || h.includes('tiempo'));
-          const swolfIdx = headers.findIndex((h) => h.includes('swolf'));
-          const hrIdx = headers.findIndex((h) => h.includes('avg hr') || h.includes('frecuencia') || h.includes('hr'));
-          const maxHrIdx = headers.findIndex((h) => h.includes('max hr'));
-          const strokesIdx = headers.findIndex((h) => h.includes('strokes') || h.includes('brazadas'));
-          const dateIdx = headers.findIndex((h) => h.includes('date') || h.includes('fecha'));
-          const titleIdx = headers.findIndex((h) => h.includes('title') || h.includes('título'));
-          const paceIdx = headers.findIndex((h) => h.includes('avg pace') || h.includes('ritmo'));
-
-          const dataLines = lines.slice(1);
-
-          dataLines.forEach((line, idx) => {
-            const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map((c) => c.replace(/^"|"$/g, '').trim());
-            if (cols.length < 2) return;
-
-            let distVal = 2000;
-            if (distIdx !== -1 && cols[distIdx]) {
-              const parsedD = parseFloat(cols[distIdx].replace(/,/g, ''));
-              if (!isNaN(parsedD) && parsedD > 0) distVal = parsedD;
-            }
-
-            let swolfVal = 34;
-            if (swolfIdx !== -1 && cols[swolfIdx]) {
-              const parsedS = parseFloat(cols[swolfIdx]);
-              if (!isNaN(parsedS) && parsedS > 0) swolfVal = parsedS;
-            }
-
-            let hrVal = 140;
-            if (hrIdx !== -1 && cols[hrIdx]) {
-              const parsedH = parseFloat(cols[hrIdx]);
-              if (!isNaN(parsedH) && parsedH > 0) hrVal = parsedH;
-            }
-
-            let maxHrVal = hrVal + 18;
-            if (maxHrIdx !== -1 && cols[maxHrIdx]) {
-              const parsedMH = parseFloat(cols[maxHrIdx]);
-              if (!isNaN(parsedMH) && parsedMH > 0) maxHrVal = parsedMH;
-            }
-
-            let strokesVal = Math.round((distVal / 25) * 15);
-            if (strokesIdx !== -1 && cols[strokesIdx]) {
-              const parsedSt = parseFloat(cols[strokesIdx].replace(/,/g, ''));
-              if (!isNaN(parsedSt) && parsedSt > 0) strokesVal = parsedSt;
-            }
-
-            let dateVal = new Date().toISOString().split('T')[0];
-            if (dateIdx !== -1 && cols[dateIdx]) {
-              const matchD = cols[dateIdx].match(/\d{4}-\d{2}-\d{2}/);
-              if (matchD) dateVal = matchD[0];
-            }
-
-            let titleVal = `Natación Garmin Real (${Math.round(distVal)}m)`;
-            if (titleIdx !== -1 && cols[titleIdx] && cols[titleIdx] !== '--') {
-              titleVal = `${cols[titleIdx]} (${Math.round(distVal)}m)`;
-            }
-
-            let paceVal = '1:30';
-            if (paceIdx !== -1 && cols[paceIdx] && cols[paceIdx].includes(':')) {
-              paceVal = cols[paceIdx];
-            }
-
-            const lapCount = Math.max(3, Math.min(8, Math.floor(distVal / 400)));
-            const lapDist = Math.round(distVal / lapCount / 25) * 25 || 250;
-            let sessionLaps = [];
-            for (let i = 1; i <= lapCount; i++) {
-              sessionLaps.push({
-                lap: i,
-                dist: lapDist,
-                pace: paceVal,
-                swolf: Math.round(swolfVal),
-                strokes: Math.round(strokesVal / lapCount),
-                hr: Math.round(hrVal),
-              });
-            }
-
-            importedSessions.push({
-              id: `garmin-csv-row-${Date.now()}-${idx}`,
-              date: dateVal,
-              title: titleVal,
-              poolLength: 25,
-              totalDistance: Math.round(distVal),
-              totalTimeSeconds: Math.round((distVal / 100) * 90),
-              avgSwolf: Math.round(swolfVal),
-              avgPace100m: paceVal,
-              avgHeartRate: Math.round(hrVal),
-              maxHeartRate: Math.round(maxHrVal),
-              totalStrokes: Math.round(strokesVal),
-              calories: Math.round(distVal * 0.22),
-              trainingLoad: Math.round(distVal * 0.065),
-              laps: sessionLaps,
-              strokesDistribution: { freestyle: 90, backstroke: 10, breaststroke: 0, butterfly: 0 },
-              hrZones: { z1: 20, z2: 45, z3: 25, z4: 10 },
-            });
-          });
-        }
-      }
-
-      setTimeout(() => {
-        if (importedSessions.length > 0) {
-          setSessions([...importedSessions, ...sessions]);
-          setSelectedSessionId(importedSessions[0].id);
-        } else {
-          // Fallback single session
-          const fallbackSession = {
-            id: `garmin-file-${Date.now()}`,
-            date: new Date().toISOString().split('T')[0],
-            title: `Garmin: ${file.name.replace(/\.[^/.]+$/, '')}`,
-            poolLength: 25,
-            totalDistance: 2500,
-            totalTimeSeconds: 2700,
-            avgSwolf: 32,
-            avgPace100m: '1:28',
-            avgHeartRate: 146,
-            maxHeartRate: 168,
-            totalStrokes: 1350,
-            calories: 580,
-            trainingLoad: 175,
-            laps: [
-              { lap: 1, dist: 500, pace: '1:30', swolf: 33, strokes: 15, hr: 140 },
-              { lap: 2, dist: 500, pace: '1:27', swolf: 31, strokes: 14, hr: 150 },
-              { lap: 3, dist: 500, pace: '1:26', swolf: 30, strokes: 14, hr: 154 },
-              { lap: 4, dist: 500, pace: '1:28', swolf: 32, strokes: 14, hr: 148 },
-              { lap: 5, dist: 500, pace: '1:31', swolf: 34, strokes: 15, hr: 142 },
-            ],
-            strokesDistribution: { freestyle: 85, backstroke: 10, breaststroke: 5, butterfly: 0 },
-            hrZones: { z1: 15, z2: 45, z3: 30, z4: 10 },
-          };
-          setSessions([fallbackSession, ...sessions]);
-          setSelectedSessionId(fallbackSession.id);
-        }
-
-        setIsUploading(false);
-        setUploadSuccess(true);
-        setTimeout(() => setUploadSuccess(false), 4000);
-      }, 700);
-    };
-
-    reader.readAsText(file);
-  };
-
-  // Handle Drag & Drop File Upload
-  const handleDropFile = (e) => {
-    e.preventDefault();
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      processUploadedFile(e.dataTransfer.files[0]);
+  // Toggle active swimmer in simulator roster
+  const handleToggleActiveSwimmer = (id) => {
+    if (activeSwimmerIds.includes(id)) {
+      if (activeSwimmerIds.length <= 1) return; // keep at least 1
+      setActiveSwimmerIds(activeSwimmerIds.filter((item) => item !== id));
+    } else {
+      if (activeSwimmerIds.length >= 8) return; // limit to 8 lanes
+      setActiveSwimmerIds([...activeSwimmerIds, id]);
     }
+    try {
+      aquaticAudio.playBubbleSound();
+    } catch (e) {}
   };
 
-  // Handle Input File Select
-  const handleFileInputChange = (e) => {
-    if (e.target.files && e.target.files[0]) {
-      processUploadedFile(e.target.files[0]);
-    }
-  };;
+  // Active Swimmers objects for simulator & comparison matrix
+  const activeSwimmers = profiles.filter((p) => activeSwimmerIds.includes(p.id));
 
-  // Add Manual Session
-  const handleAddManualSession = (e) => {
-    e.preventDefault();
-    aquaticAudio.playBubbleSound();
-
-    const timeSecs = manualTimeMin * 60;
-    const pace100Secs = Math.round(timeSecs / (manualDist / 100));
-    const paceMins = Math.floor(pace100Secs / 60);
-    const paceRemSecs = pace100Secs % 60;
-    const paceStr = `${paceMins}:${paceRemSecs < 10 ? '0' : ''}${paceRemSecs}`;
-
-    // SWOLF formula: time in seconds for 25m pool lap + stroke count
-    const lapTimeSecs = pace100Secs / (100 / manualPool);
-    const calculatedSwolf = Math.round(lapTimeSecs + Number(manualStrokesPerLap));
-
-    const manualSession = {
-      id: `garmin-manual-${Date.now()}`,
-      date: new Date().toISOString().split('T')[0],
-      title: `Natación Registrada (${manualDist}m)`,
-      poolLength: Number(manualPool),
-      totalDistance: Number(manualDist),
-      totalTimeSeconds: timeSecs,
-      avgSwolf: calculatedSwolf,
-      avgPace100m: paceStr,
-      avgHeartRate: 145,
-      maxHeartRate: 168,
-      totalStrokes: Math.round((manualDist / manualPool) * manualStrokesPerLap),
-      calories: Math.round(manualDist * 0.22),
-      trainingLoad: Math.round(manualDist * 0.06),
+  // Current session object for analytics tab
+  const currentSession =
+    sessions.find((s) => s.id === selectedSessionId) || profiles[0]?.workouts[0] || {
+      id: 'default',
+      title: 'Sesión Garmin Base',
+      totalDistance: 2500,
+      avgSwolf: 32,
+      avgPace100m: '1:26',
+      avgHeartRate: 146,
       laps: [
-        { lap: 1, dist: manualDist / 2, pace: paceStr, swolf: calculatedSwolf, strokes: manualStrokesPerLap, hr: 142 },
-        { lap: 2, dist: manualDist / 2, pace: paceStr, swolf: calculatedSwolf + 1, strokes: manualStrokesPerLap, hr: 148 },
+        { lap: 1, dist: 500, swolf: 33, hr: 140, pace: '1:28' },
+        { lap: 2, dist: 500, swolf: 31, hr: 148, pace: '1:25' },
+        { lap: 3, dist: 500, swolf: 30, hr: 152, pace: '1:24' },
       ],
-      strokesDistribution: { freestyle: 100, backstroke: 0, breaststroke: 0, butterfly: 0 },
-      hrZones: { z1: 20, z2: 60, z3: 20, z4: 0 },
+      strokesDistribution: { freestyle: 90, backstroke: 10, breaststroke: 0, butterfly: 0 },
     };
-
-    setSessions([manualSession, ...sessions]);
-    setSelectedSessionId(manualSession.id);
-    setShowManualForm(false);
-  };
-
-  // Chart 1: Lap Pace & SWOLF Line Chart
-  const lapChartData = {
-    labels: currentSession.laps.map((l) => `Serie ${l.lap} (${l.dist}m)`),
-    datasets: [
-      {
-        label: 'SWOLF (Menor = Más Eficiente)',
-        data: currentSession.laps.map((l) => l.swolf),
-        borderColor: '#00f2fe',
-        backgroundColor: 'rgba(0, 242, 254, 0.15)',
-        tension: 0.4,
-        fill: true,
-        pointBackgroundColor: '#00f2fe',
-        pointRadius: 5,
-        yAxisID: 'ySWOLF',
-      },
-      {
-        label: 'Frecuencia Cardíaca (ppm)',
-        data: currentSession.laps.map((l) => l.hr),
-        borderColor: '#ff4b5c',
-        borderDash: [5, 5],
-        backgroundColor: 'transparent',
-        tension: 0.3,
-        pointBackgroundColor: '#ff4b5c',
-        pointRadius: 4,
-        yAxisID: 'yHR',
-      },
-    ],
-  };
-
-  const lapChartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { labels: { color: '#cbd5e1', font: { family: 'Inter' } } },
-      tooltip: {
-        backgroundColor: 'rgba(6, 19, 37, 0.9)',
-        borderColor: '#00f2fe',
-        borderWidth: 1,
-        titleColor: '#00f2fe',
-        bodyColor: '#fff',
-      },
-    },
-    scales: {
-      x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#94a3b8' } },
-      ySWOLF: {
-        type: 'linear',
-        position: 'left',
-        grid: { color: 'rgba(0, 242, 254, 0.1)' },
-        ticks: { color: '#00f2fe' },
-        title: { display: true, text: 'SWOLF Score', color: '#00f2fe' },
-      },
-      yHR: {
-        type: 'linear',
-        position: 'right',
-        grid: { drawOnChartArea: false },
-        ticks: { color: '#ff4b5c' },
-        title: { display: true, text: 'ppm (Heart Rate)', color: '#ff4b5c' },
-      },
-    },
-  };
-
-  // Chart 2: Strokes Distribution Doughnut
-  const strokeChartData = {
-    labels: ['Estilo Libre (Crawl)', 'Espalda', 'Pecho (Braza)', 'Mariposa'],
-    datasets: [
-      {
-        data: [
-          currentSession.strokesDistribution.freestyle,
-          currentSession.strokesDistribution.backstroke,
-          currentSession.strokesDistribution.breaststroke,
-          currentSession.strokesDistribution.butterfly,
-        ],
-        backgroundColor: ['#00f2fe', '#4facfe', '#00ffb3', '#ffd700'],
-        borderWidth: 2,
-        borderColor: '#061325',
-      },
-    ],
-  };
 
   return (
-    <div className="space-y-8 animate-fadeIn">
+    <div className="space-y-3 animate-fadeIn">
       
-      {/* Header Banner */}
-      <div className="glass-panel-glow p-6 md:p-8 rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6 border border-biolum-cyan/40">
-        <div>
-          <div className="flex items-center gap-3 mb-2">
-            <span className="px-3 py-1 rounded-full text-xs font-bold bg-biolum-cyan/20 text-biolum-cyan border border-biolum-cyan/40 flex items-center gap-1.5">
-              <Waves className="w-3.5 h-3.5 animate-pulse" />
-              GARMIN SWIM ANALYTICS HUB
-            </span>
-            <span className="text-xs text-slate-400">Garmin Swim 2 / Forerunner Sync</span>
-          </div>
-          <h2 className="text-3xl font-extrabold font-heading text-white tracking-tight">
-            Métricas de Natación &amp; Eficiencia SWOLF
+      {/* Top Banner Navigation & Quick Actions */}
+      <div className="flex flex-col sm:flex-row glass-panel-glow p-3 px-4 sm:px-5 rounded-2xl border border-biolum-cyan/40 items-start sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-biolum-cyan/20 text-biolum-cyan border border-biolum-cyan/40 flex items-center gap-1 font-mono">
+            <Waves className="w-3 h-3 animate-pulse" />
+            CÓMO NADO 2D
+          </span>
+          <h2 className="text-xs sm:text-base font-black font-heading text-white tracking-tight">
+            Plataforma de Simulación &amp; Comparación en Vivo
           </h2>
-          <p className="text-sm text-slate-300 mt-1">
-            Monitoreo biomecánico, ritmo por 100m, conteo de brazadas y zonas aeróbicas.
-          </p>
         </div>
 
-        <div className="flex flex-wrap gap-3">
+        {/* Global Action Buttons */}
+        <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
           <button
-            onClick={() => {
-              aquaticAudio.playBubbleSound();
-              setIsGarminConnectOpen(true);
-            }}
-            className="px-4 py-2.5 rounded-xl text-xs font-bold bg-gradient-to-r from-biolum-cyan via-ocean-600 to-biolum-teal hover:from-biolum-cyan hover:to-biolum-teal text-white border border-biolum-cyan/60 shadow-lg shadow-biolum-cyan/20 flex items-center gap-2 transition-all"
+            onClick={() => setIsGarminConnectOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-ocean-950 hover:bg-ocean-800 text-biolum-cyan border border-biolum-cyan/40 font-extrabold text-[10px] sm:text-[11px] transition-all shadow-md"
           >
-            <Zap className="w-4 h-4 text-amber-300 animate-pulse" />
-            Conectar Garmin (Directo BD)
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" /> Cargar Garmin / CSV
           </button>
 
           <button
-            onClick={onOpenGuide}
-            className="glass-button px-4 py-2.5 rounded-xl text-xs font-semibold text-biolum-cyan flex items-center gap-2"
+            onClick={() => setIsShareModalOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 text-ocean-950 font-black text-[10px] sm:text-[11px] shadow-md shadow-amber-500/20 hover:brightness-110 transition-all"
           >
-            <HelpCircle className="w-4 h-4" />
-            Guía Sincronización
-          </button>
-          
-          <button
-            onClick={async () => {
-              aquaticAudio.playSplash();
-              await dbService.clearAll();
-              setSessions([]);
-              setSelectedSessionId(null);
-              window.location.reload();
-            }}
-            className="px-3.5 py-2.5 rounded-xl text-xs font-semibold bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center gap-1.5 transition-all"
-            title="Borrar memoria del navegador y resetear datos"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Resetear Memoria
+            <Share2 className="w-3.5 h-3.5" /> Compartir
           </button>
         </div>
       </div>
 
-      {/* Hero Swimming Efficiency & Biomechanics Block */}
-      <SwimEfficiencyHeroBlock session={currentSession} allSessions={sessions} />
-
-      {/* Interactive Biomechanical Stroke Simulator & Head-to-Head Comparison */}
-      <SwimStrokeSimulator session={currentSession} allSessions={sessions} />
-
-      {/* Manual Entry Form Collapsible */}
-      {showManualForm && (
-        <form
-          onSubmit={handleAddManualSession}
-          className="glass-panel p-6 rounded-2xl border border-biolum-cyan/40 grid grid-cols-1 md:grid-cols-4 gap-4 animate-slideDown"
+      {/* Main Navigation Tabs */}
+      <div className="flex flex-nowrap overflow-x-auto items-center gap-1.5 sm:gap-2 border-b border-ocean-800 pb-2.5 scrollbar-thin">
+        <button
+          onClick={() => setActiveTab('technique')}
+          className={`flex items-center gap-1.5 px-3 sm:px-5 py-2 sm:py-3 rounded-xl sm:rounded-2xl font-heading font-extrabold text-[11px] sm:text-xs transition-all shrink-0 ${
+            activeTab === 'technique'
+              ? 'bg-biolum-cyan text-ocean-950 shadow-lg shadow-biolum-cyan/30 scale-105'
+              : 'glass-panel text-slate-300 hover:text-white border border-ocean-750'
+          }`}
         >
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Distancia Total (m)</label>
-            <input
-              type="number"
-              value={manualDist}
-              onChange={(e) => setManualDist(e.target.value)}
-              className="w-full bg-ocean-950 border border-ocean-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-biolum-cyan"
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Tiempo Total (Minutos)</label>
-            <input
-              type="number"
-              value={manualTimeMin}
-              onChange={(e) => setManualTimeMin(e.target.value)}
-              className="w-full bg-ocean-950 border border-ocean-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-biolum-cyan"
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Brazadas prom. por largo (25m)</label>
-            <input
-              type="number"
-              value={manualStrokesPerLap}
-              onChange={(e) => setManualStrokesPerLap(e.target.value)}
-              className="w-full bg-ocean-950 border border-ocean-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-biolum-cyan"
-              required
-            />
-          </div>
-          <div className="flex items-end">
-            <button
-              type="submit"
-              className="w-full glass-button py-2 px-4 rounded-lg text-sm font-semibold text-biolum-cyan border border-biolum-cyan/50"
-            >
-              Guardar &amp; Calcular SWOLF
-            </button>
-          </div>
-        </form>
+          <Sliders className="w-3.5 h-3.5 text-amber-300" /> Simulador Biomecánico
+        </button>
+
+
+
+        <button
+          onClick={() => setActiveTab('profiles')}
+          className={`flex items-center gap-1.5 px-3 sm:px-5 py-2 sm:py-3 rounded-xl sm:rounded-2xl font-heading font-extrabold text-[11px] sm:text-xs transition-all shrink-0 ${
+            activeTab === 'profiles'
+              ? 'bg-biolum-cyan text-ocean-950 shadow-lg shadow-biolum-cyan/30 scale-105'
+              : 'glass-panel text-slate-300 hover:text-white border border-ocean-750'
+          }`}
+        >
+          <Users className="w-3.5 h-3.5" /> Perfiles Garmin ({profiles.length})
+        </button>
+
+        <button
+          onClick={() => setActiveTab('matrix')}
+          className={`flex items-center gap-1.5 px-3 sm:px-5 py-2 sm:py-3 rounded-xl sm:rounded-2xl font-heading font-extrabold text-[11px] sm:text-xs transition-all shrink-0 ${
+            activeTab === 'matrix'
+              ? 'bg-biolum-cyan text-ocean-950 shadow-lg shadow-biolum-cyan/30 scale-105'
+              : 'glass-panel text-slate-300 hover:text-white border border-ocean-750'
+          }`}
+        >
+          <Swords className="w-3.5 h-3.5" /> Cabeza a Cabeza
+        </button>
+      </div>
+
+
+      {/* TAB 2: Biomechanical Technique Stroke Simulator */}
+      {activeTab === 'technique' && (
+        <div className="space-y-8">
+          <SwimStrokeSimulator session={currentSession} allSessions={sessions} profiles={profiles} />
+        </div>
       )}
 
-      {/* Session Selector & File Drag-and-Drop Zone */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* Left: Session List Selector */}
-        <div className="glass-panel p-5 rounded-2xl border border-ocean-700 space-y-3">
-          <div className="flex items-center justify-between text-xs font-semibold text-slate-400 uppercase tracking-wider">
-            <span>Historial de Actividades</span>
-            <button
-              onClick={() => {
-                const realOnly = sessions.filter((s) => s.source || s.id.startsWith('garmin-manual') || s.id.startsWith('garmin-real'));
-                if (realOnly.length > 0) {
-                  setSessions(realOnly);
-                  setSelectedSessionId(realOnly[0].id);
-                } else {
-                  setSessions([]);
-                }
-              }}
-              className="text-[10px] text-amber-300 hover:underline hover:text-white"
-            >
-              Borrar Datos de Ejemplo
-            </button>
-          </div>
+      {/* TAB 3: Swimmer Profiles & Garmin Averages Manager */}
+      {activeTab === 'profiles' && (
+        <SwimmerProfileManager
+          profiles={profiles}
+          activeSwimmerIds={activeSwimmerIds}
+          onToggleActiveSwimmer={handleToggleActiveSwimmer}
+          onProfilesUpdated={reloadProfiles}
+          onOpenGarminConnect={() => setIsGarminConnectOpen(true)}
+        />
+      )}
 
-          <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
-            {sessions.map((s) => {
-              const isRealData = s.source || s.id.startsWith('garmin-manual') || s.id.startsWith('garmin-real') || s.id.startsWith('garmin-live');
+      {/* TAB 4: Side-by-Side Comparison Matrix */}
+      {activeTab === 'matrix' && (
+        <SwimmerComparisonMatrix activeSwimmers={activeSwimmers} />
+      )}
 
-              return (
-                <button
-                  key={s.id}
-                  onClick={() => {
-                    setSelectedSessionId(s.id);
-                    aquaticAudio.playBubbleSound();
-                  }}
-                  className={`w-full text-left p-3.5 rounded-xl transition-all border ${
-                    s.id === selectedSessionId
-                      ? 'bg-ocean-800/90 border-biolum-cyan text-white shadow-lg shadow-biolum-cyan/10'
-                      : 'bg-ocean-900/40 border-ocean-800 text-slate-300 hover:bg-ocean-800/40'
-                  }`}
-                >
-                  <div className="flex justify-between items-start">
-                    <div className="space-y-0.5">
-                      <span className="font-semibold text-sm line-clamp-1">{s.title}</span>
-                      <span
-                        className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold border inline-block ${
-                          isRealData
-                            ? 'bg-biolum-emerald/20 text-biolum-emerald border-biolum-emerald/40'
-                            : 'bg-amber-400/15 text-amber-300 border-amber-400/30'
-                        }`}
-                      >
-                        {isRealData ? '🟢 TUS DATOS GARMIN REALES' : '🟡 DATO DE EJEMPLO / DEMO'}
-                      </span>
-                    </div>
-                    <span className="text-[10px] text-biolum-cyan font-mono bg-biolum-cyan/10 px-2 py-0.5 rounded border border-biolum-cyan/20 shrink-0">
-                      {s.date}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs text-slate-400 mt-2 font-mono">
-                    <span>🏊 {s.totalDistance}m</span>
-                    <span>⏱️ {formatTime(s.totalTimeSeconds)}</span>
-                    <span>⚡ SWOLF: <strong className="text-biolum-emerald">{s.avgSwolf}</strong></span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Right: Drag & Drop FIT/CSV Uploader */}
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={handleDropFile}
-          className="lg:col-span-2 glass-panel p-6 rounded-2xl border-2 border-dashed border-biolum-cyan/30 hover:border-biolum-cyan/70 transition-all flex flex-col items-center justify-center text-center relative group"
-        >
-          {isUploading ? (
-            <div className="flex flex-col items-center gap-3 py-6">
-              <RefreshCw className="w-10 h-10 text-biolum-cyan animate-spin" />
-              <p className="text-sm font-semibold text-biolum-cyan">
-                Procesando archivo Garmin FIT / CSV...
-              </p>
-              <span className="text-xs text-slate-400">Extrayendo laps, SWOLF y frecuencias cardíacas</span>
-            </div>
-          ) : (
-            <div className="space-y-3 py-4">
-              <div className="p-4 bg-biolum-cyan/10 rounded-full text-biolum-cyan inline-block border border-biolum-cyan/30 group-hover:scale-110 transition-transform">
-                <Upload className="w-8 h-8" />
-              </div>
-              <h4 className="text-base font-bold text-white">
-                Arrastra tu archivo Garmin (.FIT / .CSV / .TCX) aquí
-              </h4>
-              <p className="text-xs text-slate-300 max-w-md mx-auto">
-                Sube las métricas exportadas directamente desde Garmin Connect Web o App para actualizar los tableros al instante.
-              </p>
-              
-              <div className="pt-2">
-                <label className="glass-button px-5 py-2.5 rounded-xl text-xs font-semibold text-biolum-cyan border border-biolum-cyan/50 cursor-pointer inline-flex items-center gap-2 hover:bg-biolum-cyan/20 transition-all">
-                  <Upload className="w-4 h-4" />
-                  Seleccionar archivo CSV / FIT desde mi PC
-                  <input
-                    type="file"
-                    accept=".csv,.fit,.tcx,.json,.txt"
-                    onChange={handleFileInputChange}
-                    className="hidden"
-                  />
-                </label>
-              </div>
-
-              {uploadSuccess && (
-                <div className="flex items-center justify-center gap-2 text-xs font-semibold text-biolum-emerald bg-biolum-emerald/10 py-1.5 px-3 rounded-full border border-biolum-emerald/30 mt-3">
-                  <CheckCircle2 className="w-4 h-4" />
-                  ¡Archivo Garmin procesado con éxito!
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* KPI Cards Section */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-4">
-        
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Waves className="w-4 h-4 text-biolum-cyan" />
-            <span>Distancia</span>
-          </div>
-          <p className="text-xl font-extrabold text-white font-mono">{currentSession.totalDistance}<span className="text-xs font-normal text-slate-400">m</span></p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Timer className="w-4 h-4 text-biolum-aqua" />
-            <span>Tiempo</span>
-          </div>
-          <p className="text-xl font-extrabold text-white font-mono">{formatTime(currentSession.totalTimeSeconds)}</p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-biolum-emerald/40 bg-biolum-emerald/5">
-          <div className="flex items-center gap-1.5 text-biolum-emerald text-xs mb-1 font-semibold">
-            <Award className="w-4 h-4" />
-            <span>SWOLF Prom.</span>
-          </div>
-          <p className="text-2xl font-black text-biolum-emerald font-mono">{currentSession.avgSwolf}</p>
-          <span className="text-[10px] text-slate-400">Alta Eficiencia</span>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Zap className="w-4 h-4 text-biolum-amber" />
-            <span>Ritmo /100m</span>
-          </div>
-          <p className="text-xl font-extrabold text-white font-mono">{currentSession.avgPace100m}</p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Heart className="w-4 h-4 text-rose-500" />
-            <span>FC Promedio</span>
-          </div>
-          <p className="text-xl font-extrabold text-rose-400 font-mono">{currentSession.avgHeartRate} <span className="text-xs">ppm</span></p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Activity className="w-4 h-4 text-biolum-cyan" />
-            <span>Brazadas</span>
-          </div>
-          <p className="text-xl font-extrabold text-white font-mono">{currentSession.totalStrokes}</p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <Flame className="w-4 h-4 text-orange-400" />
-            <span>Calorías</span>
-          </div>
-          <p className="text-xl font-extrabold text-white font-mono">{currentSession.calories} <span className="text-xs">kcal</span></p>
-        </div>
-
-        <div className="glass-panel p-4 rounded-xl border border-ocean-700">
-          <div className="flex items-center gap-1.5 text-slate-400 text-xs mb-1">
-            <TrendingDown className="w-4 h-4 text-indigo-400" />
-            <span>Carga Garmin</span>
-          </div>
-          <p className="text-xl font-extrabold text-indigo-300 font-mono">{currentSession.trainingLoad}</p>
-        </div>
-
-      </div>
-
-      {/* Main Interactive Charts Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* SWOLF & Pace Evolution Line Chart */}
-        <div className="lg:col-span-2 glass-panel p-6 rounded-2xl border border-ocean-700 flex flex-col justify-between">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h3 className="text-lg font-bold text-white font-heading">
-                Evolución de Eficiencia SWOLF &amp; Frecuencia Cardíaca
-              </h3>
-              <p className="text-xs text-slate-400">
-                El SWOLF combina tiempo por lap + brazadas. Un puntaje menor refleja mejor deslizamiento hidrodinámico.
-              </p>
-            </div>
-            <span className="text-xs font-mono text-biolum-cyan bg-biolum-cyan/10 px-2.5 py-1 rounded-full border border-biolum-cyan/30">
-              Piscina {currentSession.poolLength}m
-            </span>
-          </div>
-
-          <div className="h-72">
-            <Line data={lapChartData} options={lapChartOptions} />
-          </div>
-        </div>
-
-        {/* Strokes Breakdown Doughnut */}
-        <div className="glass-panel p-6 rounded-2xl border border-ocean-700 flex flex-col justify-between">
-          <div>
-            <h3 className="text-lg font-bold text-white font-heading mb-1">
-              Distribución de Estilos
+      {/* TAB 4: Detailed Individual Garmin Session Analytics */}
+      {activeTab === 'analytics' && (
+        <div className="space-y-6">
+          <div className="glass-panel p-6 rounded-3xl border border-ocean-750">
+            <h3 className="text-lg font-bold font-heading text-white mb-2">
+              Histórico Individual de Entrenamientos Sync Garmin
             </h3>
-            <p className="text-xs text-slate-400 mb-4">
-              Porcentaje detectado por el sensor inercial del reloj Garmin.
+            <p className="text-xs text-slate-400 font-mono">
+              Selecciona una sesión específica para analizar curvas de laps y distribución por series.
             </p>
           </div>
 
-          <div className="h-56 flex items-center justify-center">
-            <Doughnut
-              data={strokeChartData}
-              options={{
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                  legend: { position: 'bottom', labels: { color: '#cbd5e1', font: { family: 'Inter', size: 11 } } },
-                },
-              }}
-            />
-          </div>
+          <SwimEfficiencyHeroBlock />
         </div>
+      )}
 
-      </div>
-
-      {/* Detailed Lap Breakdown Table */}
-      <div className="glass-panel p-6 rounded-2xl border border-ocean-700 overflow-x-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-bold text-white font-heading">
-            Desglose Detallado por Laps &amp; Intervalos (Garmin Data Splits)
-          </h3>
-          <span className="text-xs text-slate-400 font-mono">
-            Piscina de {currentSession.poolLength} metros
-          </span>
-        </div>
-
-        <table className="w-full text-left text-xs font-mono">
-          <thead>
-            <tr className="border-b border-ocean-700 text-slate-400 uppercase tracking-wider">
-              <th className="pb-3 px-3">Serie / Lap</th>
-              <th className="pb-3 px-3">Distancia</th>
-              <th className="pb-3 px-3">Ritmo /100m</th>
-              <th className="pb-3 px-3">SWOLF Score</th>
-              <th className="pb-3 px-3">Brazadas / Largo</th>
-              <th className="pb-3 px-3">FC Prom.</th>
-              <th className="pb-3 px-3">Estado</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-ocean-800/60 text-slate-200">
-            {currentSession.laps.map((lap) => (
-              <tr key={lap.lap} className="hover:bg-ocean-800/40 transition-colors">
-                <td className="py-3 px-3 font-bold text-biolum-cyan">Serie #{lap.lap}</td>
-                <td className="py-3 px-3">{lap.dist}m</td>
-                <td className="py-3 px-3 font-semibold">{lap.pace}</td>
-                <td className="py-3 px-3 font-bold text-biolum-emerald">{lap.swolf}</td>
-                <td className="py-3 px-3">{lap.strokes} mov</td>
-                <td className="py-3 px-3 text-rose-400">{lap.hr} ppm</td>
-                <td className="py-3 px-3">
-                  <span className="px-2 py-0.5 rounded text-[10px] bg-biolum-cyan/10 text-biolum-cyan border border-biolum-cyan/30">
-                    Completado
-                  </span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Garmin Connect Direct Login & DB Modal */}
+      {/* Modals */}
       <GarminConnectModal
         isOpen={isGarminConnectOpen}
         onClose={() => setIsGarminConnectOpen(false)}
         onSyncComplete={(newSessions) => {
-          if (newSessions && newSessions.length > 0) {
-            setSessions((prev) => [...newSessions, ...prev.filter((p) => !newSessions.some((n) => n.id === p.id))]);
-            setSelectedSessionId(newSessions[0].id);
-          }
-          garminConnectService.getStatus().then(setDbStatus);
+          reloadProfiles();
         }}
+      />
+
+      <ShareSimulationModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        activeSwimmers={activeSwimmers}
+        raceSettings={{ poolLength: 25, raceDistance: 100 }}
       />
 
     </div>
